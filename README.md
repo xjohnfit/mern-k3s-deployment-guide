@@ -267,7 +267,7 @@ metadata:
   labels:
     app: APP_NAME-backend
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: APP_NAME-backend
@@ -303,11 +303,11 @@ spec:
         # Add other secrets as needed
         resources:
           requests:
-            memory: "256Mi"
-            cpu: "200m"
+            memory: "128Mi"
+            cpu: "75m"
           limits:
             memory: "512Mi"
-            cpu: "400m"
+            cpu: "500m"
         livenessProbe:
           httpGet:
             path: /api/health  # YOUR_HEALTH_ENDPOINT
@@ -360,7 +360,7 @@ metadata:
   labels:
     app: APP_NAME-frontend
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: APP_NAME-frontend
@@ -378,10 +378,10 @@ spec:
         resources:
           requests:
             memory: "64Mi"
-            cpu: "50m"
+            cpu: "25m"
           limits:
-            memory: "128Mi"
-            cpu: "100m"
+            memory: "256Mi"
+            cpu: "250m"
         livenessProbe:
           httpGet:
             path: /
@@ -1059,6 +1059,72 @@ kubectl port-forward service/APP_NAME-backend 4001:4001
 
 # Delete all resources
 kubectl delete -f kubernetes/
+```
+
+---
+
+## ⚙️ Single-Node VPS Optimization
+
+When running all apps on a single-node VPS, right-size your deployments to avoid resource exhaustion and scheduling issues.
+
+### 1) Keep One Replica Per App
+
+```bash
+sudo kubectl scale deployment fitverse-backend fitverse-frontend \
+  portfolio-backend portfolio-frontend \
+  streamify-backend streamify-frontend \
+  weather-app upscale-banking \
+  --replicas=1
+```
+
+### 2) Right-Size Resources
+
+```bash
+# Backends
+sudo kubectl set resources deployment/fitverse-backend   --requests=cpu=75m,memory=128Mi  --limits=cpu=500m,memory=512Mi
+sudo kubectl set resources deployment/portfolio-backend  --requests=cpu=75m,memory=128Mi  --limits=cpu=500m,memory=512Mi
+sudo kubectl set resources deployment/streamify-backend  --requests=cpu=75m,memory=128Mi  --limits=cpu=500m,memory=512Mi
+
+# Frontends + weather
+sudo kubectl set resources deployment/fitverse-frontend  --requests=cpu=25m,memory=64Mi   --limits=cpu=250m,memory=256Mi
+sudo kubectl set resources deployment/portfolio-frontend --requests=cpu=25m,memory=64Mi   --limits=cpu=250m,memory=256Mi
+sudo kubectl set resources deployment/streamify-frontend --requests=cpu=25m,memory=64Mi   --limits=cpu=250m,memory=256Mi
+sudo kubectl set resources deployment/weather-app        --requests=cpu=25m,memory=64Mi   --limits=cpu=250m,memory=256Mi
+
+# Upscale banking (Next.js app)
+sudo kubectl set resources deployment/upscale-banking    --requests=cpu=150m,memory=256Mi --limits=cpu=1000m,memory=1Gi
+```
+
+### 3) Prevent Rollout Surge Pods
+
+Surge pods can temporarily double resource usage, which is critical to avoid on a single node.
+
+```bash
+for d in fitverse-backend fitverse-frontend \
+         portfolio-backend portfolio-frontend \
+         streamify-backend streamify-frontend \
+         weather-app upscale-banking
+do
+  sudo kubectl patch deployment "$d" --type='merge' -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
+done
+```
+
+### 4) Restart to Apply Changes
+
+```bash
+sudo kubectl rollout restart deployment fitverse-backend fitverse-frontend \
+  portfolio-backend portfolio-frontend \
+  streamify-backend streamify-frontend \
+  weather-app upscale-banking
+```
+
+### 5) Verify Cluster Schedulability and Usage
+
+```bash
+sudo kubectl rollout status deployment/upscale-banking --timeout=5m
+sudo kubectl get pods -A
+sudo kubectl describe node srv641124 | sed -n '/Allocated resources:/,/Events:/p'
+sudo kubectl top node
 ```
 
 ---
