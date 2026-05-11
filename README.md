@@ -43,6 +43,7 @@ Next.js has a built-in **standalone** output mode that produces a minimal, self-
 
 In your `next.config.js` (or `next.config.ts`):
 
+For **CommonJS** config (`next.config.js`):
 ```js
 /** @type {import('next').NextConfig} */
 const nextConfig = {
@@ -50,6 +51,17 @@ const nextConfig = {
 };
 
 module.exports = nextConfig;
+```
+
+For **ES module** or **TypeScript** config (`next.config.mjs` / `next.config.ts`):
+```ts
+import type { NextConfig } from 'next';
+
+const nextConfig: NextConfig = {
+  output: 'standalone',
+};
+
+export default nextConfig;
 ```
 
 This tells Next.js to bundle only the files needed to run the app, resulting in a much smaller Docker image.
@@ -110,10 +122,9 @@ ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
 
-# Health check
+# Health check — adjust path to a real route in your app
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD node -e "require('http').get('http://localhost:3000/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})" || \
-    node -e "require('http').get('http://localhost:3000/', (r) => {process.exit(r.statusCode < 500 ? 0 : 1)})"
+    CMD node -e "require('http').get('http://localhost:3000/', (r) => {process.exit(r.statusCode < 500 ? 0 : 1)})"
 
 # Use dumb-init to handle signals properly
 ENTRYPOINT ["dumb-init", "--"]
@@ -125,7 +136,7 @@ CMD ["node", "server.js"]
 **Notes:**
 - The `output: 'standalone'` config in `next.config.js` is required for `server.js` to be generated
 - `HOSTNAME="0.0.0.0"` is required so the server binds to all interfaces inside the container
-- Adjust the health check path to match a real route in your app (e.g., `/api/health`)
+- The health check probes `/` by default. If you want a dedicated health endpoint, create `app/api/health/route.ts` returning `{ status: 'ok' }` and update the path to `/api/health`
 
 ---
 
@@ -430,6 +441,7 @@ jobs:
     
     - name: Update deployment with new image tag
       run: |
+        # The container name 'app' must match the name in kubernetes/deployment.yml
         kubectl set image deployment/APP_NAME app=${{ secrets.DOCKERHUB_USERNAME }}/APP_NAME:${{ steps.image-tag.outputs.IMAGE_TAG }}
     
     - name: Wait for rollout to complete
