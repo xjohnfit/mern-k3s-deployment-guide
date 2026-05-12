@@ -267,7 +267,12 @@ metadata:
   labels:
     app: APP_NAME-backend
 spec:
-  replicas: 2
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: APP_NAME-backend
@@ -301,13 +306,15 @@ spec:
               name: APP_NAME-secrets
               key: JWT_SECRET
         # Add other secrets as needed
+        # Resources for backend: --requests=cpu=75m,memory=128Mi  --limits=cpu=500m,memory=512Mi
+        # Repources for frontend: --requests=cpu=25m,memory=64Mi   --limits=cpu=250m,memory=256Mi
         resources:
           requests:
-            memory: "256Mi"
-            cpu: "200m"
+            memory: "128Mi"
+            cpu: "75m"
           limits:
             memory: "512Mi"
-            cpu: "400m"
+            cpu: "500m"
         livenessProbe:
           httpGet:
             path: /api/health  # YOUR_HEALTH_ENDPOINT
