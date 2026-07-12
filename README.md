@@ -94,14 +94,14 @@ COPY --from=builder --chown=nodejs:nodejs /app/dist ./dist
 USER nodejs
 
 # Expose port (use your backend port)
-EXPOSE 4001
+EXPOSE 5000
 
 # Set environment to production
 ENV NODE_ENV=production
 
 # Health check (adjust path and port as needed)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD node -e "require('http').get('http://localhost:4001/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+    CMD node -e "require('http').get('http://localhost:5000/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
 
 # Use dumb-init to handle signals properly
 ENTRYPOINT ["dumb-init", "--"]
@@ -111,7 +111,7 @@ CMD ["node", "dist/index.js"]
 ```
 
 **Adjust:**
-- Port number (4001 → your port)
+- Port number (5000 → your port)
 - Health check path (`/api/health`)
 - Entry file (`dist/index.js`)
 
@@ -161,12 +161,12 @@ RUN mkdir -p /var/cache/nginx /var/log/nginx /tmp && \
 # Switch to non-root user
 USER nginx-app
 
-# Expose port
-EXPOSE 8080
+# Expose port (matches Vite's default dev server port for consistency)
+EXPOSE 5173
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --quiet --tries=1 --spider http://localhost:8080/ || exit 1
+    CMD wget --quiet --tries=1 --spider http://localhost:5173/ || exit 1
 
 # Use dumb-init to handle signals properly
 ENTRYPOINT ["dumb-init", "--"]
@@ -220,7 +220,7 @@ http {
     gzip_disable "msie6";
 
     server {
-        listen 8080;
+        listen 5173;
         server_name _;
         root /usr/share/nginx/html;
         index index.html;
@@ -385,7 +385,7 @@ spec:
         image: ${DOCKERHUB_USERNAME}/${APP_NAME}-frontend:${IMAGE_TAG}
         imagePullPolicy: Always
         ports:
-        - containerPort: 8080
+        - containerPort: 5173
         # Static nginx serving pre-built assets — needs almost nothing at rest.
         resources:
           requests:
@@ -397,18 +397,18 @@ spec:
         livenessProbe:
           httpGet:
             path: /
-            port: 8080
+            port: 5173
           initialDelaySeconds: 30
           periodSeconds: 10
         readinessProbe:
           httpGet:
             path: /
-            port: 8080
+            port: 5173
           initialDelaySeconds: 5
           periodSeconds: 5
 ```
 
-Frontend container port (8080) and probe path (`/`) are left as fixed values on purpose — they're a convention of this guide's nginx setup (Step 1), not something that varies per project.
+Frontend container port (5173, matching Vite's default dev server port for consistency) and probe path (`/`) are left as fixed values on purpose — they're a convention of this guide's nginx setup (Step 1), not something that varies per project. This port is purely internal to the K3s pod network (nginx ↔ Service ↔ Ingress) — it's never exposed directly on the VPS, so it has no effect on your firewall/ufw rules.
 
 ### Frontend Service
 
@@ -425,7 +425,7 @@ spec:
   ports:
   - protocol: TCP
     port: 80
-    targetPort: 8080
+    targetPort: 5173
   type: ClusterIP
 ```
 
@@ -972,7 +972,7 @@ For anything that would be sensitive if leaked (API keys, connection strings, to
 ### Required Variables (Variables tab → New repository variable)
 
 1. **APP_NAME** - Your app name, used to build image names and Kubernetes object names (e.g. `fitverse`)
-2. **BACKEND_PORT** - The port your backend listens on (e.g. `4001`)
+2. **BACKEND_PORT** - The port your backend listens on (e.g. `5000`)
 3. **HEALTH_CHECK_PATH** - Backend health endpoint used by the liveness/readiness probes (e.g. `/api/health`)
 4. **LETSENCRYPT_EMAIL** - Email address used for SSL certificate registration
 5. **VITE_API_URL** - Public URL the frontend calls (e.g. `https://api.app.yourdomain.com`)
@@ -1239,8 +1239,8 @@ kubectl describe ingress $APP_NAME-ingress
 # Execute command in pod
 kubectl exec -it POD_NAME -- /bin/sh
 
-# Port forward for debugging (replace 4001 with your BACKEND_PORT)
-kubectl port-forward service/$APP_NAME-backend 4001:4001
+# Port forward for debugging (replace 5000 with your BACKEND_PORT)
+kubectl port-forward service/$APP_NAME-backend 5000:5000
 
 # Delete this app's resources only
 # (raw files under kubernetes/ contain unexpanded ${VAR} placeholders and
