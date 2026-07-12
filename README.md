@@ -367,7 +367,7 @@ metadata:
   labels:
     app: APP_NAME-frontend
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: APP_NAME-frontend
