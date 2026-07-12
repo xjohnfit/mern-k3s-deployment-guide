@@ -308,13 +308,17 @@ spec:
               name: ${APP_NAME}-secrets
               key: JWT_SECRET
         # Add other secrets as needed — keep the pattern above
+        # Tuned for low-traffic personal projects sharing one small VPS — the
+        # CPU *request* is what's reserved against the node's schedulable
+        # capacity, so keeping it low lets more projects coexist on one box.
+        # Bump these for a specific project only if it actually sees real traffic.
         resources:
           requests:
-            memory: "128Mi"
-            cpu: "75m"
+            memory: "64Mi"
+            cpu: "15m"
           limits:
-            memory: "512Mi"
-            cpu: "500m"
+            memory: "256Mi"
+            cpu: "150m"
         livenessProbe:
           httpGet:
             path: ${HEALTH_CHECK_PATH}
@@ -363,6 +367,11 @@ metadata:
     app: ${APP_NAME}-frontend
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: ${APP_NAME}-frontend
@@ -377,13 +386,14 @@ spec:
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
+        # Static nginx serving pre-built assets — needs almost nothing at rest.
         resources:
           requests:
+            memory: "32Mi"
+            cpu: "5m"
+          limits:
             memory: "64Mi"
             cpu: "50m"
-          limits:
-            memory: "128Mi"
-            cpu: "100m"
         livenessProbe:
           httpGet:
             path: /
