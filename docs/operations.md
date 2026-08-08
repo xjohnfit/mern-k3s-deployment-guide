@@ -77,6 +77,30 @@ docker pull DOCKERHUB_USERNAME/$APP_NAME-backend:latest
 # Verify DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets
 ```
 
+### `scan-images` CI job fails on a CVE not in your dependencies
+
+If the pipeline dies in `scan-images` with a CRITICAL finding that doesn't appear anywhere in `package-lock.json` or `npm ls`, check what package the finding is actually in — `node:*-alpine` base images ship a global npm install with its own bundled internal `tar` package, and that bundled tar has had CRITICAL CVEs of its own (gzip-bomb DoS, etc.) with nothing to do with your app's code. It's confusing the first time because it genuinely isn't one of your dependencies. Fix is in the Dockerfile, not your app: remove npm/npx/corepack from the final image (see the `rm -rf` step in the backend Dockerfile and the SSR frontend Dockerfile, Step 1 of [setup-guide.md](setup-guide.md)) since the running container only needs `node`, never `npm`, at runtime. Catch this locally next time by running `trivy image <local-image>` after `docker build` — see "Test your images locally before pushing" at the end of Step 1.
+
+### `trivy-action` fails to resolve / can't find a pinned tag
+
+A pinned third-party GitHub Action can break even without you touching your workflow, if *its own* pinned dependency gets cleaned up upstream. This happened with `aquasecurity/trivy-action@v0.28.0`, which pinned `aquasecurity/setup-trivy@v0.2.1` — a tag the aquasecurity org later deleted, so the action stopped resolving entirely. If a pinned action suddenly fails to resolve, don't assume you broke something: check the pinned version's own `action.yml`/release notes for what tag or dependency it references, and bump to a newer release if that dependency has moved on. Current setup-guide.md pins `trivy-action@v0.36.0`, which sidesteps this specific failure mode by pinning `setup-trivy` by commit SHA instead of a mutable tag — but check [the tags page](https://github.com/aquasecurity/trivy-action/tags) for whatever's current before assuming that pin is still the latest stable one.
+
+### A deploy went out to production without pausing for approval
+
+`environment: production` in the `deploy` job (Step 3) only pauses for approval if that Environment already has a `required_reviewers` protection rule actually saved to it. Referencing the Environment name in the workflow does not create the rule by itself — if it was never saved (a UI click that silently didn't register, or the Environment simply not created yet), GitHub auto-creates it with zero protection rules on first use and `deploy` runs straight through, with no error or warning to flag that the gate didn't apply. This looks exactly like a successful, ungated deploy, because that's exactly what it is.
+
+Check whether the rule is actually in place:
+
+```bash
+gh api repos/<owner>/<repo>/environments/production --jq '.protection_rules'
+```
+
+An empty array (`[]`) means there's no reviewer gate at all — fix it with the `gh api -X PUT .../environments/production` command in Step 5 of [setup-guide.md](setup-guide.md), then re-run this check to confirm it saved before trusting it again. This is also worth checking any time a repo gets transferred or an Environment gets recreated, not just once at initial setup.
+
+### Manually running the workflow ("Run workflow" button) does nothing
+
+If you trigger the workflow via `workflow_dispatch` (Actions tab → this workflow → Run workflow) — e.g. to redeploy after changing a secret with no new commit — and the run finishes green but nothing actually deployed, check whether `build-and-push`, `scan-images`, and `deploy` show as **Skipped** rather than having run. Their `if` conditions have to explicitly include `github.event_name == 'workflow_dispatch'` alongside `push`; if a copy of this workflow only checks for `push`, a manual run passes the test/scan jobs and then silently skips the three jobs that actually do anything, with no failure anywhere to flag it. Compare your workflow's `if:` lines on those two jobs against the current version in [setup-guide.md](setup-guide.md) Step 3.
+
 ---
 
 ## 🔄 Making Updates

@@ -6,13 +6,17 @@ Step-by-step instructions to stand up a new MERN project on this pipeline, from 
 
 ## 🐳 Step 1: Create Docker Files
 
+> **Node version — don't just trust the default.** The Dockerfiles and CI workflow below default to Node 22. Treat that as a starting point, not a given: run `npm ci` for each service locally (backend and frontend, separately — they frequently need different Node versions from each other) and read its output for `EBADENGINE` warnings. Those tell you exactly what version that service's own dependencies expect. Match the Dockerfile's `FROM node:X-alpine` **and** the CI workflow's `setup-node` `node-version` to that, per service — copying the same number into both places without checking is how you end up with a container that builds fine locally (different Node on your machine) but breaks in CI or at runtime. Also worth knowing: GitHub-hosted runners are in the process of deprecating Node 20 — workflows that request `node-version: '20'` already print a deprecation warning, and runner images have started silently substituting Node 24 instead. Node 20 is not a safe default for new projects for that reason alone; this guide uses 22 as a template default, but bump it further if `EBADENGINE` says to.
+>
+> **Static SPA vs. SSR frontend — pick your path now.** Everything in this Step 1 (and the frontend K8s manifests in Step 2) assumes a static single-page app: Vite builds plain HTML/JS/CSS, nginx serves the files, client-side routing handles navigation. If your frontend does server-side rendering instead (React Router v8 SSR, Remix, Next.js, etc.), that model doesn't apply — loaders/actions need a live Node process per request, not a directory of static files. Follow the static-SPA Dockerfile/nginx.conf below if that's what you have; if you're on SSR, skip ahead to the "Fork point: SSR frontend" callout after the nginx.conf section for the Node-based alternative.
+
 ### Backend Dockerfile
 
 Create `backend/Dockerfile`:
 
 ```dockerfile
 # Build stage
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 
 # Set working directory
 WORKDIR /app
@@ -30,7 +34,7 @@ COPY . .
 RUN npm run build
 
 # Production stage
-FROM node:20-alpine
+FROM node:22-alpine
 
 # Create app directory
 WORKDIR /app
@@ -48,6 +52,22 @@ COPY package*.json ./
 # Install only production dependencies
 RUN npm ci --only=production && \
     npm cache clean --force
+
+# node:*-alpine ships a global npm install, and that npm bundles its own
+# internal copy of the `tar` package — separate from anything in your
+# package-lock.json. When that bundled tar has a CRITICAL CVE (npm ships new
+# versions on its own schedule, independent of the app), it trips the
+# scan-images Trivy gate in CI even though it has nothing to do with your
+# app's own dependencies — `npm ls` won't show it, which is what makes it
+# confusing to debug the first time you hit it. The container only ever runs
+# `node dist/index.js` (see CMD below), never `npm` itself, so the fix is to
+# delete npm/npx/corepack from the final image entirely rather than try to
+# patch or ignore the CVE.
+RUN rm -rf /usr/local/lib/node_modules/npm \
+           /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm \
+           /usr/local/bin/npx \
+           /usr/local/bin/corepack
 
 # Copy built application from builder stage
 COPY --from=builder --chown=nodejs:nodejs /app/dist ./dist
@@ -83,7 +103,7 @@ Create `frontend/Dockerfile`:
 
 ```dockerfile
 # Build stage
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /app
 
@@ -139,6 +159,8 @@ CMD ["nginx", "-g", "daemon off;"]
 
 **Adjust:**
 - Build output directory (`/app/dist` → your build folder: might be `/app/build`)
+
+Note this static-SPA production stage is `nginx:alpine`, not a `node:*-alpine` — so it never has npm in it to begin with, and doesn't need the npm/tar removal step used in the backend Dockerfile above. That fix only applies to production stages that are themselves `node:*-alpine` (the backend, and the SSR frontend variant further down).
 
 ### Frontend nginx.conf
 
@@ -213,6 +235,124 @@ http {
 }
 ```
 
+### ⚠️ Fork point: SSR frontend (React Router v8 SSR, Remix, Next.js, etc.)
+
+Everything above — the Dockerfile, `nginx.conf`, and the frontend K8s manifests in Step 2 — assumes a **static SPA**: Vite produces plain HTML/JS/CSS, nginx serves those files, and `try_files ... /index.html` hands unknown paths to client-side routing. That model has no server-side code running per request, which is exactly what breaks for a **server-rendering frontend**: loaders/actions execute on the server for every request, so you need a live Node process, not a static file server. If that's your project, use this Dockerfile instead of the one above — and skip `nginx.conf` entirely, it doesn't apply.
+
+```dockerfile
+# Build stage
+FROM node:22-alpine AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+
+# Build the framework's server + client bundles (path depends on the
+# framework — this is react-router build's default output layout).
+RUN npm run build
+
+# Production stage — node:*-alpine, not nginx:alpine, because we need a
+# live Node process to run the SSR server, not just serve static files.
+FROM node:22-alpine
+
+WORKDIR /app
+
+RUN apk add --no-cache dumb-init
+
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001
+
+COPY package*.json ./
+
+# Only production deps — the running server doesn't need the bundler, type
+# checker, etc. that devDependencies bring in for the build step above.
+RUN npm ci --omit=dev && \
+    npm cache clean --force
+
+# Same bundled-tar CVE issue as the backend Dockerfile (see its comment
+# above the equivalent step) — this production stage is node:*-alpine too,
+# so it ships the same vulnerable npm-bundled tar unless removed. Safe here
+# because CMD below invokes node directly rather than going through npm.
+RUN rm -rf /usr/local/lib/node_modules/npm \
+           /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm \
+           /usr/local/bin/npx \
+           /usr/local/bin/corepack
+
+# Copy the built server/client output and the production node_modules the
+# server needs to actually run (unlike the static SPA, there's no "just the
+# dist folder" here — the SSR server is a real Node app).
+COPY --from=builder --chown=nodejs:nodejs /app/build ./build
+COPY --from=builder --chown=nodejs:nodejs /app/node_modules ./node_modules
+COPY --from=builder --chown=nodejs:nodejs /app/package.json ./package.json
+
+USER nodejs
+
+# SSR frontends listen on whatever port the framework's own PORT env var
+# controls — this is NOT the static-SPA template's assumed nginx port 5173.
+# react-router-serve defaults to 3000; check your framework's docs and match
+# the K8s Service/Deployment ports in Step 2 to whatever you set here.
+EXPOSE 3000
+ENV NODE_ENV=production
+ENV PORT=3000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD node -e "require('http').get('http://localhost:3000/', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+
+ENTRYPOINT ["dumb-init", "--"]
+
+# Do NOT use ["npm", "run", "start"] — npm was just deleted from this image
+# (see the rm -rf step above), so `npm run start` would fail outright.
+# Invoke the framework's own entry point with node directly instead. For
+# React Router v8 SSR that's @react-router/serve's CLI; confirm the exact
+# path in your own build (`ls node_modules/@react-router/serve/dist`) rather
+# than trusting this literally — it will differ by framework and version.
+CMD ["node", "node_modules/@react-router/serve/dist/cli.js", "./build/server/index.js"]
+```
+
+**The other half of this fork — how the frontend reaches the backend:** the static-SPA template passes `VITE_API_URL` as a **build-time** arg (Step 3) because the browser calls the API directly, and Vite bakes that URL into the JS bundle at build time. An SSR frontend doesn't need that at all — its loaders/actions call the backend from **inside the server**, during rendering, not from the user's browser. So instead of a build-time arg, give the SSR container a **runtime** env var (e.g. `BACKEND_URL`) pointing at the backend's internal ClusterIP Service DNS name (`http://${APP_NAME}-backend:${BACKEND_PORT}`, from the Service created in Step 2) — no public URL, no build-time baking, and it can change without rebuilding the image. Document whichever pattern your project actually uses; don't carry both.
+
+### 🧪 Test your images locally before pushing
+
+This step catches two entire classes of failure before they ever cost you a CI run — worth doing every time you touch a Dockerfile, not just once. It's what surfaced a real env-validation gap on the frontend during this guide's first real deploy (the app started fine even with nonsense config instead of failing loudly), and it's what would have caught the bundled-tar CVE described above before ever pushing to CI.
+
+```bash
+# 1. Build both images locally, exactly as CI will.
+docker build -t local/backend ./backend
+docker build -t local/frontend ./frontend   # or the SSR Dockerfile if you forked above
+
+# 2. Run each with fake-but-correctly-shaped env vars — real variable names,
+#    plausible-looking fake values (e.g. a MONGO_URI that points nowhere).
+#    You're not testing that the app works end-to-end here; you're testing
+#    that bad/missing config fails LOUDLY with a clear log line, rather than
+#    hanging silently or crash-looping with no explanation. A container that
+#    just sits there with no output on bad config is a debugging trap in
+#    production — better to find that out on your own machine.
+docker run --rm -e NODE_ENV=production -e PORT=5000 \
+  -e MONGO_URI="mongodb://fake:fake@localhost:27017/fake" \
+  -e JWT_SECRET="fake-secret-just-for-this-test" \
+  -p 5000:5000 local/backend
+
+docker run --rm -e NODE_ENV=production -e PORT=3000 \
+  -e BACKEND_URL="http://fake:5000" \
+  -p 3000:3000 local/frontend   # env vars here depend on static vs SSR — see the fork above
+
+# 3. Scan the images you just built — not just the source tree, and not just
+#    in CI. `trivy image` runs the exact same scanner the scan-images CI job
+#    uses, locally, in seconds, against the actual artifact you're about to
+#    ship. This is the step that would have caught the bundled-tar CVE
+#    (see the backend Dockerfile above) before it ever reached a pipeline
+#    run — `docker build` succeeding tells you nothing about known CVEs in
+#    the base image or its bundled tooling.
+trivy image local/backend
+trivy image local/frontend
+```
+
+If step 3 requires installing Trivy locally, see the [Trivy installation docs](https://trivy.dev/latest/getting-started/installation/) — it's the same binary the `trivy-action` GitHub Action wraps, so what fails here is what fails in CI, just faster to iterate on.
+
 ---
 
 ## ☸️ Step 2: Create Kubernetes Manifests
@@ -245,6 +385,13 @@ spec:
       labels:
         app: ${APP_NAME}-backend
     spec:
+      # This pod never talks to the Kubernetes API (it's a REST/GraphQL
+      # backend, not a controller or operator), so the token K8s would
+      # otherwise auto-mount into every pod by default is unused attack
+      # surface: if the container is ever compromised, there's simply no
+      # credential sitting in the filesystem for an attacker to steal and
+      # use against the cluster API.
+      automountServiceAccountToken: false
       containers:
       - name: backend
         image: ${DOCKERHUB_USERNAME}/${APP_NAME}-backend:${IMAGE_TAG}
@@ -270,6 +417,23 @@ spec:
               name: ${APP_NAME}-secrets
               key: JWT_SECRET
         # Add other secrets as needed — keep the pattern above
+        # Defense in depth on top of the Dockerfile's own USER nodejs: even
+        # if an image somehow got built or overridden to run as root, K8s
+        # itself refuses to start the container as root (runAsNonRoot),
+        # pins it to the exact UID the Dockerfile's `adduser -u 1001`
+        # created (so a "run as root" image fails loudly instead of quietly
+        # succeeding as UID 0), blocks the container from ever gaining more
+        # privileges than it started with (allowPrivilegeEscalation), and
+        # strips every Linux capability it wasn't explicitly granted — a
+        # plain Node HTTP server needs none of them (e.g. no NET_BIND_SERVICE,
+        # since we listen on an unprivileged port above 1024).
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
         # Tuned for low-traffic personal projects sharing one small VPS — the
         # CPU *request* is what's reserved against the node's schedulable
         # capacity, so keeping it low lets more projects coexist on one box.
@@ -342,13 +506,34 @@ spec:
       labels:
         app: ${APP_NAME}-frontend
     spec:
+      # Same reasoning as the backend Deployment above: nginx (or the SSR
+      # Node server, if you forked in Step 1) never calls the Kubernetes
+      # API, so there's no reason to hand it a token that could talk to it.
+      automountServiceAccountToken: false
       containers:
       - name: frontend
         image: ${DOCKERHUB_USERNAME}/${APP_NAME}-frontend:${IMAGE_TAG}
         imagePullPolicy: Always
         ports:
         - containerPort: 5173
+        # Same rationale as the backend's securityContext above — pinned to
+        # UID 1001 to match the nginx-app user the frontend Dockerfile
+        # creates (Step 1). If you forked to the SSR Dockerfile, this is
+        # still 1001 since that template creates its non-root user the same
+        # way — check your Dockerfile's `adduser -u` value if you changed it.
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
         # Static nginx serving pre-built assets — needs almost nothing at rest.
+        # This profile assumes the static-SPA path from Step 1. If you forked
+        # to the SSR Dockerfile instead, delete this block and use a profile
+        # closer to the backend's above — an SSR Node process does real
+        # per-request work (rendering, loader calls to the backend), unlike
+        # nginx handing out files from disk, so 32Mi/5m will throttle it hard.
         resources:
           requests:
             memory: "32Mi"
@@ -371,6 +556,8 @@ spec:
 ```
 
 Frontend container port (5173, matching Vite's default dev server port for consistency) and probe path (`/`) are left as fixed values on purpose — they're a convention of this guide's nginx setup (Step 1), not something that varies per project. This port is purely internal to the K3s pod network (nginx ↔ Service ↔ Ingress) — it's never exposed directly on the VPS, so it has no effect on your firewall/ufw rules.
+
+**If you forked to the SSR Dockerfile in Step 1:** the fixed `5173`/nginx assumptions above don't apply. Set `containerPort`, the liveness/readiness probe `port`, and `frontend-service.yml`'s `targetPort` (below) to whatever port your framework's `PORT` env var is actually set to (`3000` in the Step 1 SSR Dockerfile example) — and add a `PORT`/`BACKEND_URL` env block to this container spec the same way the backend Deployment above reads its secrets, rather than a `VITE_API_URL` build arg.
 
 ### Frontend Service
 
@@ -472,18 +659,12 @@ spec:
             port:
               number: 80
   # Backend API - e.g. api.app.yourdomain.com
+  # No www.${BACKEND_DOMAIN} rule here on purpose: nobody browses to a "www."
+  # prefix on an API subdomain, so a default rule for it is just an unused
+  # DNS record and an extra name on the TLS cert for no benefit. If some
+  # specific project actually needs it, copy this block, change the host to
+  # `www.${BACKEND_DOMAIN}`, and add that host to the `tls.hosts` list below.
   - host: ${BACKEND_DOMAIN}
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: ${APP_NAME}-backend
-            port:
-              number: ${BACKEND_PORT}
-  # Backend API - e.g. www.api.app.yourdomain.com
-  - host: www.${BACKEND_DOMAIN}
     http:
       paths:
       - path: /
@@ -498,7 +679,6 @@ spec:
     - ${FRONTEND_DOMAIN}
     - www.${FRONTEND_DOMAIN}
     - ${BACKEND_DOMAIN}
-    - www.${BACKEND_DOMAIN}
     secretName: ${APP_NAME}-tls
 ```
 
@@ -605,6 +785,21 @@ jobs:
           fail-on-severity: high
 
   # ---- Fail fast: don't scan or build an app that doesn't build/pass ----
+  # NOTE on `--if-present`: it makes `npm run lint`/`npm test` silently no-op
+  # if the project has no `lint`/`test` script — deliberately, so this
+  # workflow doesn't force every project to define scripts it may not need
+  # yet. But that means an absent script is a SILENT gap, not a failure —
+  # this job passing doesn't mean lint/tests actually ran, only that they
+  # didn't fail. Check your own package.json has real `lint`/`test` scripts
+  # if you want this gate to mean anything for those two.
+  #
+  # Also: `npm run build --if-present` is NOT a type-check for a Vite
+  # frontend. Vite's production build strips TypeScript types via esbuild
+  # without ever checking them, so a build can succeed with type errors
+  # still in the code. Only `tsc` (or `tsc --noEmit`) actually type-checks.
+  # If your frontend has a separate `typecheck` script, add an explicit
+  # `npm run typecheck` step below rather than relying on `build` to catch
+  # type errors — it won't.
   test-backend:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -615,13 +810,19 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # 22 is this template's default — check EBADENGINE warnings from
+          # `npm ci` and set this to whatever the backend's own dependencies
+          # actually need (see the Node version note in Step 1). Keep this
+          # in sync with the backend Dockerfile's `FROM node:X-alpine`.
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
       - run: npm ci
       - run: npm run lint --if-present
       - run: npm test --if-present
       - run: npm run build --if-present
+      # If backend/package.json has a `typecheck` script, add it explicitly:
+      # - run: npm run typecheck
 
   test-frontend:
     runs-on: ubuntu-latest
@@ -633,13 +834,20 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # Same caveat as the backend job above — frontend and backend can
+          # legitimately need different Node versions; don't assume they match.
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
       - run: npm run lint --if-present
       - run: npm test --if-present
       - run: npm run build --if-present
+      # `build` alone does NOT type-check a Vite project (see the note
+      # above) — if frontend/package.json has a `typecheck` script
+      # (e.g. `tsc --noEmit`), run it explicitly so real type errors fail
+      # this job instead of shipping silently:
+      # - run: npm run typecheck
 
   # ---- Source-level scan: secrets, IaC misconfig, known-vulnerable deps ----
   trivy-fs-scan:
@@ -652,7 +860,23 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Run Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.28.0
+        # Pinned actions can still break without you touching anything: this
+        # action itself used to be pinned here at v0.28.0, which resolved
+        # fine for a while, then started failing outright — v0.28.0 pins its
+        # own internal dependency (aquasecurity/setup-trivy) to a tag
+        # (v0.2.1) that the aquasecurity org later deleted upstream. A pin
+        # only freezes *this* action's version string; it doesn't freeze
+        # what that version's own dependencies point at, so if a pinned
+        # action's own transitive references get cleaned up upstream, your
+        # "unchanged" workflow starts failing to resolve anyway. That's not
+        # something you did wrong — when a pin suddenly breaks, check what
+        # the pinned version's own dependencies reference (its release notes
+        # or action.yml) rather than assuming your workflow regressed.
+        # v0.36.0 fixes this specific failure mode by pinning setup-trivy by
+        # commit SHA instead of a mutable tag. Check
+        # https://github.com/aquasecurity/trivy-action/tags for whatever the
+        # current latest stable release is before reusing this template.
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: 'fs'
           scan-ref: '.'
@@ -672,7 +896,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [test-backend, test-frontend, trivy-fs-scan]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Must include workflow_dispatch, not just push — the `on:` trigger list
+    # above includes workflow_dispatch specifically so you can manually kick
+    # off a real deploy with no new commit (e.g. redeploying to pick up a
+    # secrets-only change). If this condition only checked `push`, a manual
+    # run would execute the test/scan jobs, then silently skip build-and-push,
+    # scan-images, and deploy — the whole run shows green with those three
+    # marked "skipped," which reads as success and is easy to miss.
+    # workflow_dispatch defaults to running against whatever branch/ref you
+    # pick in the Actions tab, so the `github.ref` check still matters here:
+    # it's what stops someone accidentally deploying from a non-main ref.
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     env:
       BACKEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ vars.APP_NAME }}-backend
       FRONTEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ vars.APP_NAME }}-frontend
@@ -746,7 +980,9 @@ jobs:
       FRONTEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ vars.APP_NAME }}-frontend
     steps:
       - name: Scan backend image
-        uses: aquasecurity/trivy-action@0.28.0
+        # See the comment on the trivy-fs-scan job's equivalent step for why
+        # this pin matters and what to do if it ever breaks again.
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.BACKEND_IMAGE }}:${{ needs.build-and-push.outputs.image-tag }}
           format: 'table'
@@ -755,7 +991,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Scan frontend image
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.FRONTEND_IMAGE }}:${{ needs.build-and-push.outputs.image-tag }}
           format: 'table'
@@ -768,7 +1004,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [build-and-push, scan-images]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Same reasoning as build-and-push's condition above — keep both in sync.
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     environment: production
     env:
       APP_NAME: ${{ vars.APP_NAME }}
@@ -847,7 +1084,7 @@ Because the image tag is baked directly into the rendered Deployment manifests, 
 
 **One-time repo setup this pipeline expects:**
 
-- Settings → Environments → create an environment named `production` and add required reviewers (this is what turns `deploy` into an approval-gated step).
+- Create the `production` Environment with required reviewers, **and verify the protection rule actually saved** — see "Set up the `production` Environment with required reviewers" in Step 5. This has a real, silent failure mode: the UI can appear to succeed while the rule never actually took, and `deploy` then runs unblocked with no error or warning either way.
 - Settings → Secrets and variables → Actions → **Variables** tab → set `APP_NAME`, `BACKEND_PORT`, `HEALTH_CHECK_PATH`, `LETSENCRYPT_EMAIL`, `VITE_API_URL`, and either (`FRONTEND_DOMAIN` + `BACKEND_DOMAIN`) or `DOMAIN` depending on which `ingress.yml` option you kept.
 
 ---
@@ -933,9 +1170,36 @@ For anything that would be sensitive if leaked (API keys, connection strings, to
 
 The `deploy` job's render step fails immediately with a clear message if `APP_NAME`, `BACKEND_PORT`, `HEALTH_CHECK_PATH`, or `LETSENCRYPT_EMAIL` are missing — so a forgotten variable shows up as a red pipeline run, not a broken deploy.
 
-### Recommended: scope secrets to the `production` environment
+### Set up the `production` Environment with required reviewers
 
-The `deploy` job in Step 3 targets `environment: production`. Once you create that environment (Settings → Environments → New environment → `production`) and add required reviewers, you can optionally move `KUBECONFIG` and your database/app secrets from repository-level secrets into that environment's own secrets. That way a compromised PR workflow (which never touches the `production` environment) can't read your cluster credentials at all — only the reviewed `deploy` job can.
+The `deploy` job (Step 3) targets `environment: production` specifically so it can be gated behind approval. But referencing `environment: production` in a workflow does **not**, by itself, create any protection rule — it just names an Environment. If that Environment doesn't already exist with a reviewer rule actually saved to it, GitHub auto-creates it on the workflow's first run with **zero** protection rules attached, and `deploy` runs straight through unblocked. There's no error, no warning, nothing distinguishing that run from one that was properly gated — it looks exactly like success, because the deploy *does* succeed, it just silently skipped the safety gate it was supposed to have. The only way to be sure is to verify the rule actually saved, not just perform the setup steps and trust that the UI took them.
+
+**Recommended: set it up via the API**, not just UI clicks — it's unambiguous and scriptable, where the Settings UI gives no strong confirmation that a reviewer was actually added:
+
+```bash
+# Find your GitHub user ID — the API needs the numeric ID, not your username
+gh api user --jq .id
+
+# Create the environment (or update it) and add yourself as a required
+# reviewer in one call
+gh api -X PUT repos/<owner>/<repo>/environments/production \
+  -f "reviewers[][type]=User" \
+  -F "reviewers[][id]=<your-user-id>"
+```
+
+(Equivalent UI path: Settings → Environments → New environment → `production` → Deployment protection rules → Required reviewers → add yourself. Both end up in the same place — the API path just leaves no room for a click that silently didn't register.)
+
+**Then verify it actually took — do this before your first push to `main`, not after:**
+
+```bash
+gh api repos/<owner>/<repo>/environments/production --jq '.protection_rules'
+```
+
+This should return a non-empty array containing a `required_reviewers` rule. If it returns `[]`, the protection rule never actually saved — regardless of what Settings appeared to show you — and the next push to `main` deploys straight to production, unblocked, exactly as if `environment: production` weren't in the workflow at all. Re-run this check any time you're unsure the Environment survived a repo transfer, a re-creation, or just time — it costs one API call and catches a failure mode that otherwise goes unnoticed until someone asks why an unreviewed deploy went out.
+
+One more thing worth knowing rather than being surprised by: `can_admins_bypass` defaults to `true` on a freshly created Environment, meaning repo admins can approve their own deploys (or push through without a second reviewer). That's intentional — it's what stops an admin from being locked out of their own production deploy during an actual emergency — not an oversight in this setup.
+
+Once the Environment exists with its protection rule confirmed, you can optionally move `KUBECONFIG` and your database/app secrets from repository-level secrets into that environment's own secrets. That way a compromised PR workflow (which never touches the `production` environment) can't read your cluster credentials at all — only the reviewed `deploy` job can.
 
 ---
 
@@ -947,7 +1211,7 @@ For separate subdomains:
 - `app.yourdomain.com` → `YOUR_VPS_IP`
 - `www.app.yourdomain.com` → `YOUR_VPS_IP`
 - `api.app.yourdomain.com` → `YOUR_VPS_IP`
-- `www.api.app.yourdomain.com` → `YOUR_VPS_IP`
+- (`www.api.app.yourdomain.com` only if you added that optional ingress rule back in Step 2 — the default template doesn't route it)
 
 Or for same domain:
 - `yourdomain.com` → `YOUR_VPS_IP`
@@ -998,7 +1262,7 @@ git push origin main
 1. Go to GitHub → Actions tab
 2. Watch the pipeline execute
 3. If this is a pull request, `dependency-review` also runs
-4. On a push to `main`, these run in order: `test-backend` / `test-frontend` → `trivy-fs-scan` → `build-and-push` → `scan-images` → `deploy` (paused for approval if you set up required reviewers on the `production` environment)
+4. On a push to `main`, these run in order: `test-backend` / `test-frontend` → `trivy-fs-scan` → `build-and-push` → `scan-images` → `deploy` (paused for approval **only if** the `production` environment's protection rule actually saved — see Step 5's verification command. If `deploy` runs straight through with no pause on this first push, that's the silent-failure case, not a feature: stop and check `gh api repos/<owner>/<repo>/environments/production --jq '.protection_rules'` before letting another push go out.)
 
 ### Check Deployment on VPS
 
@@ -1029,4 +1293,7 @@ The workflow and Kubernetes manifests never need editing between projects — ev
 - [ ] Adjust CPU/memory resource limits in the manifests if this app's footprint differs from the defaults
 - [ ] Update the backend port and health check path in the Dockerfile (Step 1) to match the `BACKEND_PORT`/`HEALTH_CHECK_PATH` variables
 - [ ] Update the frontend build output directory in the Dockerfile if it's not `dist` (e.g. Create React App uses `build`)
-- [ ] Create the `production` GitHub Environment with required reviewers (Step 5)
+- [ ] Check `npm ci`'s `EBADENGINE` output for each service and set the Dockerfile base image + CI `setup-node` version accordingly, per service (Step 1)
+- [ ] Decide static SPA vs. SSR frontend and use the matching Dockerfile/nginx.conf/K8s manifest pattern (Step 1 and Step 2) — don't mix the two
+- [ ] Run the local Docker + `trivy image` recipe at the end of Step 1 before your first push
+- [ ] Create the `production` GitHub Environment with required reviewers, **then verify** with `gh api repos/<owner>/<repo>/environments/production --jq '.protection_rules'` that the rule actually saved (Step 5) — this step has a silent failure mode where the UI appears to succeed but the gate never takes
